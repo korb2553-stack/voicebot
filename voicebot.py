@@ -1,0 +1,571 @@
+import os
+import json
+import time
+import asyncio
+import discord
+from discord.ext import commands
+
+# ===================== ตั้งค่า =====================
+def load_token():
+    t = os.getenv("DISCORD_TOKEN")
+    if t:
+        return t.strip()
+    try:
+        with open("token.txt", "r", encoding="utf-8") as f:  # ไฟล์นี้ไม่ต้องขึ้น GitHub
+            return f.read().strip()
+    except FileNotFoundError:
+        raise SystemExit("ไม่พบโทเคน: ตั้ง DISCORD_TOKEN หรือสร้างไฟล์ token.txt")
+
+
+TOKEN = load_token()
+PREFIX = "!"
+
+# ยศที่ใช้คำสั่งทีมงาน และยศที่ถูกข้าม ตั้งจากในดิสด้วย /ตั้งค่ายศ (เฉพาะแอดมิน)
+LOBBY_CHANNEL_ID = 0        # ห้องเสียงที่กดเข้าเพื่อสร้างห้องส่วนตัว
+ROOM_CATEGORY_ID = 0        # หมวดหมู่ที่สร้างห้อง (0 = หมวดเดียวกับ lobby)
+DATA_FILE = "vroom_data.json"
+# ==================================================
+
+intents = discord.Intents.default()
+intents.members = True
+intents.voice_states = True
+intents.message_content = True
+
+
+# ---------- เก็บข้อมูล ----------
+class Store:
+    def __init__(self):
+        self.rooms = {}      # channel_id -> owner_id
+        self.users = {}      # owner_id -> {name, limit, status, bans}
+        self.config = {"staff_roles": [], "protected_roles": []}
+        self.load()
+
+    def load(self):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self.rooms = {int(k): v for k, v in d.get("rooms", {}).items()}
+            self.users = {int(k): v for k, v in d.get("users", {}).items()}
+            self.config.update(d.get("config", {}))
+        except Exception:
+            pass
+
+    def save(self):
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({"rooms": self.rooms, "users": self.users, "config": self.config}, f, ensure_ascii=False)
+
+    def profile(self, uid):
+        return self.users.setdefault(uid, {"name": None, "limit": 0, "status": None, "bans": []})
+
+
+store = Store()
+
+
+class VoiceBot(commands.Bot):
+    async def setup_hook(self):
+        self.add_view(PanelView())
+        try:
+            await self.tree.sync()
+        except Exception as e:
+            print("sync error:", e)
+
+
+bot = VoiceBot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+
+# ===================== ส่วนที่ 1: คำสั่งทีมงาน =====================
+def is_staff():
+    async def pred(ctx):
+        m = ctx.author
+        return m.guild_permissions.administrator or any(r.id in store.config["staff_roles"] for r in m.roles)
+    return commands.check(pred)
+
+
+def has_protected(m):
+    return any(r.id in store.config["protected_roles"] for r in m.roles)
+
+
+def lines(members):
+    return "\n".join(f"• {m.mention} | {m.display_name} | {m.id}" for m in members)
+
+
+async def mass_voice(ctx, mode):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send("เข้าห้องเสียงก่อนใช้คำสั่งนี้")
+    if ctx.interaction:
+        await ctx.defer()
+    vc = ctx.author.voice.channel
+    t0 = time.perf_counter()
+    ok, already, protected, failed = [], [], [], []
+    todo = []
+    for m in vc.members:
+        if m.bot or m.id == ctx.author.id:
+            continue
+        if has_protected(m):
+            protected.append(m)
+        elif mode == "mute" and m.voice.mute:
+            already.append(m)
+        elif mode == "unmute" and not m.voice.mute:
+            already.append(m)
+        else:
+            todo.append(m)
+
+    async def do(m):
+        if mode == "mute":
+            await m.edit(mute=True)
+        elif mode == "unmute":
+            await m.edit(mute=False)
+        else:
+            await m.move_to(None)
+
+    results = await asyncio.gather(*[do(m) for m in todo], return_exceptions=True)
+    for m, r in zip(todo, results):
+        (failed if isinstance(r, Exception) else ok).append(m)
+
+    secs = time.perf_counter() - t0
+    if mode == "disconnect":
+        text = (f"✂️ ตัดการเชื่อมต่อในห้อง **{vc.name}** เสร็จแล้ว!\n"
+                f"• ตัดแล้ว: {len(ok)} คน\n• ข้าม (มี role): {len(protected)} คน\n"
+                f"• ไม่สำเร็จ: {len(failed)} คน\n⚡ เวลาที่ใช้: {secs:.2f} วินาที")
+        return await ctx.send(text)
+
+    title, label, color = (("🔇 รายงาน Server Mute", "Mute", discord.Color.red()) if mode == "mute"
+                           else ("🔊 รายงาน Server Unmute", "Unmute", discord.Color.green()))
+    desc = f"{vc.mention}\n\n✅ **{label} สำเร็จ ({len(ok)} คน)**\n{lines(ok)}"
+    if already:
+        desc += f"\n⏭️ **ข้ามคนที่{'ถูก Mute อยู่แล้ว' if mode == 'mute' else 'ไม่ได้ถูก Mute'}**\n{len(already)} คน"
+    if protected:
+        desc += f"\n🛡️ **ข้าม (มี role) ({len(protected)} คน)**\n" + "\n".join(f"• {m.display_name}" for m in protected)
+    if failed:
+        desc += f"\n❌ **ไม่สำเร็จ**\n{len(failed)} คน"
+    embed = discord.Embed(title=title, description=desc[:4000], color=color)
+    embed.set_footer(text=f"⚡ เวลาที่ใช้: {secs:.2f} วินาที")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="ไมค์แดง", description="Server Mute ทุกคนในห้องเสียงที่คุณอยู่")
+@is_staff()
+async def mic_red(ctx):
+    await mass_voice(ctx, "mute")
+
+
+@bot.hybrid_command(name="ปลดไมค์", description="ปลด Server Mute ทุกคนในห้องเสียงที่คุณอยู่")
+@is_staff()
+async def mic_free(ctx):
+    await mass_voice(ctx, "unmute")
+
+
+@bot.hybrid_command(name="ตัดหมด", description="ตัดการเชื่อมต่อทุกคนในห้องเสียงที่คุณอยู่")
+@is_staff()
+async def cut_all(ctx):
+    await mass_voice(ctx, "disconnect")
+
+
+# ----- ตั้งค่ายศจากในดิส (เฉพาะแอดมิน) -----
+def settings_embed(guild):
+    def fmt(ids):
+        txt = " ".join(f"<@&{i}>" for i in ids if guild.get_role(i))
+        return txt or "ยังไม่ได้ตั้ง"
+    e = discord.Embed(title="⚙️ ตั้งค่ายศ", color=discord.Color.blurple())
+    e.add_field(name="🛠️ ยศที่ใช้ !ไมค์แดง !ปลดไมค์ !ตัดหมด ได้", value=fmt(store.config["staff_roles"]), inline=False)
+    e.add_field(name="🛡️ ยศที่ถูกข้าม (ไม่โดนมิวต์/ตัด)", value=fmt(store.config["protected_roles"]), inline=False)
+    e.set_footer(text="เลือกได้หลายยศ • เอาเครื่องหมายออกทั้งหมดเพื่อล้างค่า • แอดมินใช้คำสั่งได้เสมอ")
+    return e
+
+
+class RoleSettingsView(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=300)
+        for key, holder, row in (("staff_roles", "เลือกยศที่ใช้คำสั่งได้", 0),
+                                 ("protected_roles", "เลือกยศที่ถูกข้าม", 1)):
+            defaults = [discord.SelectDefaultValue(id=i, type=discord.SelectDefaultValueType.role)
+                        for i in store.config[key] if guild.get_role(i)][:25]
+            sel = discord.ui.RoleSelect(placeholder=holder, min_values=0, max_values=25,
+                                        default_values=defaults, row=row)
+            sel.callback = self.make_cb(key, sel)
+            self.add_item(sel)
+
+    def make_cb(self, key, sel):
+        async def cb(i: discord.Interaction):
+            store.config[key] = [r.id for r in sel.values]
+            store.save()
+            await i.response.edit_message(embed=settings_embed(i.guild))
+        return cb
+
+    async def interaction_check(self, i: discord.Interaction):
+        if not i.user.guild_permissions.administrator:
+            await i.response.send_message("เฉพาะแอดมินเท่านั้น", ephemeral=True)
+            return False
+        return True
+
+
+@bot.hybrid_command(name="ตั้งค่ายศ", description="ตั้งค่ายศที่ใช้คำสั่งทีมงานและยศที่ถูกข้าม (แอดมินเท่านั้น)")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def set_roles(ctx):
+    await ctx.send(embed=settings_embed(ctx.guild), view=RoleSettingsView(ctx.guild))
+
+
+# ===================== ส่วนที่ 2: ห้องส่วนตัว =====================
+def is_locked(ch):
+    return ch.overwrites_for(ch.guild.default_role).connect is False
+
+
+def is_hidden(ch):
+    return ch.overwrites_for(ch.guild.default_role).view_channel is False
+
+
+async def act_lock(ch, locked):
+    ow = ch.overwrites_for(ch.guild.default_role)
+    ow.connect = False if locked else True
+    await ch.set_permissions(ch.guild.default_role, overwrite=ow)
+    return "🔒 ล็อคห้องแล้ว" if locked else "🔓 เปิดห้องแล้ว (ทุกคนเข้าได้)"
+
+
+async def act_hide(ch, hidden):
+    ow = ch.overwrites_for(ch.guild.default_role)
+    ow.view_channel = False if hidden else True
+    await ch.set_permissions(ch.guild.default_role, overwrite=ow)
+    return "🙈 ซ่อนห้องแล้ว" if hidden else "👁️ แสดงห้องให้ทุกคนเห็นแล้ว"
+
+
+async def act_limit(ch, owner_id, n):
+    n = max(0, min(99, n))
+    await ch.edit(user_limit=n)
+    store.profile(owner_id)["limit"] = n
+    store.save()
+    return f"👥 จำกัดจำนวนคน: {'ไม่จำกัด' if n == 0 else n}"
+
+
+async def act_name(ch, owner_id, name):
+    name = name.strip()[:100]
+    await ch.edit(name=name)
+    store.profile(owner_id)["name"] = name
+    store.save()
+    return f"✏️ เปลี่ยนชื่อห้องเป็น {name}"
+
+
+async def act_status(ch, owner_id, text):
+    try:
+        await ch.edit(status=text[:500] or None)
+    except Exception:
+        return "❌ ตั้งสถานะไม่ได้ (ต้องใช้ discord.py 2.5 ขึ้นไป และบอทต้องมีสิทธิ์จัดการห้อง)"
+    store.profile(owner_id)["status"] = text[:500]
+    store.save()
+    return f"💬 ตั้งสถานะห้องแล้ว: {text}"
+
+
+def guard(owner_id, member):
+    if member.id == owner_id:
+        return "ทำกับเจ้าของห้องไม่ได้"
+    if member.bot:
+        return "ทำกับบอทไม่ได้"
+    return None
+
+
+async def act_grant(ch, owner_id, member):
+    if (g := guard(owner_id, member)):
+        return g
+    prof = store.profile(owner_id)
+    if member.id in prof["bans"]:
+        prof["bans"].remove(member.id)
+        store.save()
+    await ch.set_permissions(member, view_channel=True, connect=True)
+    return f"✅ อนุญาตให้ {member.mention} เห็นและเข้าห้องแล้ว"
+
+
+async def act_kick(ch, owner_id, member):
+    if (g := guard(owner_id, member)):
+        return g
+    await ch.set_permissions(member, connect=False)
+    if member in ch.members:
+        await member.move_to(None)
+    return f"🚫 เตะ {member.mention} ออกและล็อคไม่ให้เข้าแล้ว (ไม่มีผลกับห้องอนาคต)"
+
+
+async def act_ban(ch, owner_id, member):
+    if (g := guard(owner_id, member)):
+        return g
+    prof = store.profile(owner_id)
+    if member.id not in prof["bans"]:
+        prof["bans"].append(member.id)
+        store.save()
+    await ch.set_permissions(member, view_channel=False, connect=False)
+    if member in ch.members:
+        await member.move_to(None)
+    return f"⛔ แบน {member.mention} แล้ว (มีผลกับห้องอนาคตจนกว่าจะปลด)"
+
+
+async def act_unban(ch, owner_id, member):
+    prof = store.profile(owner_id)
+    if member.id in prof["bans"]:
+        prof["bans"].remove(member.id)
+        store.save()
+    await ch.set_permissions(member, overwrite=None)
+    return f"♻️ ปลดแบน {member.mention} แล้ว"
+
+
+def panel_embed(owner, ch):
+    e = discord.Embed(title=f"🎶 ห้องของ {owner.display_name}", color=discord.Color.blurple())
+    e.add_field(name="👑 เจ้าของ", value=owner.mention)
+    e.add_field(name="🔐 การเข้าถึง", value="🔒 ล็อค" if is_locked(ch) else "🔓 ปลดล็อค")
+    e.add_field(name="👀 การมองเห็น", value="🙈 ซ่อน" if is_hidden(ch) else "👁️ แสดง")
+    e.add_field(name="👥 จำนวนคน", value=f"{len(ch.members)} / {ch.user_limit or 'ไม่จำกัด'}")
+    e.set_footer(text="กดปุ่มด้านล่างเพื่อจัดการห้องของคุณ • เจ้าของห้องเท่านั้น")
+    return e
+
+
+# ----- ปุ่ม / Modal / เลือกคน -----
+class LimitModal(discord.ui.Modal, title="จำกัดจำนวนคน"):
+    n = discord.ui.TextInput(label="จำนวนคน (0=ไม่จำกัด สูงสุด 99)", max_length=2)
+
+    def __init__(self, ch, owner_id):
+        super().__init__()
+        self.ch, self.owner_id = ch, owner_id
+
+    async def on_submit(self, i: discord.Interaction):
+        if not self.n.value.isdigit():
+            return await i.response.send_message("ใส่เป็นตัวเลขเท่านั้น", ephemeral=True)
+        await i.response.send_message(await act_limit(self.ch, self.owner_id, int(self.n.value)), ephemeral=True)
+
+
+class NameModal(discord.ui.Modal, title="เปลี่ยนชื่อห้อง"):
+    name = discord.ui.TextInput(label="ชื่อห้องใหม่", max_length=100)
+
+    def __init__(self, ch, owner_id):
+        super().__init__()
+        self.ch, self.owner_id = ch, owner_id
+
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.send_message(await act_name(self.ch, self.owner_id, self.name.value), ephemeral=True)
+
+
+class PickView(discord.ui.View):
+    def __init__(self, ch, owner_id, mode):
+        super().__init__(timeout=60)
+        self.ch, self.owner_id, self.mode = ch, owner_id, mode
+        self.sel = discord.ui.UserSelect(placeholder="เลือกคน")
+        self.sel.callback = self.cb
+        self.add_item(self.sel)
+
+    async def cb(self, i: discord.Interaction):
+        m = i.guild.get_member(self.sel.values[0].id)
+        if not m:
+            return await i.response.edit_message(content="ไม่พบคนนี้ในเซิร์ฟเวอร์", view=None)
+        fn = act_grant if self.mode == "grant" else act_kick
+        await i.response.edit_message(content=await fn(self.ch, self.owner_id, m), view=None)
+
+
+class PanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, i: discord.Interaction):
+        owner = store.rooms.get(i.channel.id)
+        if owner is None:
+            await i.response.send_message("ห้องนี้ไม่ใช่ห้องส่วนตัว", ephemeral=True)
+            return False
+        if owner != i.user.id:
+            await i.response.send_message("เจ้าของห้องเท่านั้น", ephemeral=True)
+            return False
+        return True
+
+    async def refresh(self, i):
+        try:
+            await i.message.edit(embed=panel_embed(i.user, i.channel))
+        except Exception:
+            pass
+
+    @discord.ui.button(label="ล็อค/ปลด", emoji="🔐", style=discord.ButtonStyle.primary, custom_id="vr:lock", row=0)
+    async def b_lock(self, i, b):
+        msg = await act_lock(i.channel, not is_locked(i.channel))
+        await i.response.send_message(msg, ephemeral=True)
+        await self.refresh(i)
+
+    @discord.ui.button(label="แสดง/ซ่อน", emoji="👁️", style=discord.ButtonStyle.primary, custom_id="vr:hide", row=0)
+    async def b_hide(self, i, b):
+        msg = await act_hide(i.channel, not is_hidden(i.channel))
+        await i.response.send_message(msg, ephemeral=True)
+        await self.refresh(i)
+
+    @discord.ui.button(label="Limit", emoji="👥", style=discord.ButtonStyle.secondary, custom_id="vr:limit", row=0)
+    async def b_limit(self, i, b):
+        await i.response.send_modal(LimitModal(i.channel, i.user.id))
+
+    @discord.ui.button(label="ชื่อห้อง", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id="vr:name", row=0)
+    async def b_name(self, i, b):
+        await i.response.send_modal(NameModal(i.channel, i.user.id))
+
+    @discord.ui.button(label="Grant", emoji="✅", style=discord.ButtonStyle.success, custom_id="vr:grant", row=1)
+    async def b_grant(self, i, b):
+        await i.response.send_message("เลือกคนที่จะอนุญาต", view=PickView(i.channel, i.user.id, "grant"), ephemeral=True)
+
+    @discord.ui.button(label="Kick", emoji="🚫", style=discord.ButtonStyle.danger, custom_id="vr:kick", row=1)
+    async def b_kick(self, i, b):
+        await i.response.send_message("เลือกคนที่จะเตะ", view=PickView(i.channel, i.user.id, "kick"), ephemeral=True)
+
+    @discord.ui.button(label="ลบห้อง", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="vr:delete", row=1)
+    async def b_delete(self, i, b):
+        store.rooms.pop(i.channel.id, None)
+        store.save()
+        await i.response.send_message("กำลังลบห้อง...", ephemeral=True)
+        await i.channel.delete()
+
+
+# ----- สร้าง / ลบห้องอัตโนมัติ -----
+async def create_room(member):
+    guild = member.guild
+    lobby = guild.get_channel(LOBBY_CHANNEL_ID)
+    cat = guild.get_channel(ROOM_CATEGORY_ID) if ROOM_CATEGORY_ID else lobby.category
+    prof = store.profile(member.id)
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),  # สร้างแบบล็อค+ซ่อนเสมอ
+        member: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, stream=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True,
+                                              move_members=True, manage_permissions=True),
+    }
+    for uid in prof["bans"]:
+        m = guild.get_member(uid)
+        if m:
+            ow[m] = discord.PermissionOverwrite(view_channel=False, connect=False)
+    ch = await guild.create_voice_channel(
+        name=prof["name"] or f"ห้องของ {member.display_name}",
+        category=cat, user_limit=prof["limit"], overwrites=ow)
+    store.rooms[ch.id] = member.id
+    store.save()
+    await member.move_to(ch)
+    if prof["status"]:
+        await act_status(ch, member.id, prof["status"])
+    await ch.send(embed=panel_embed(member, ch), view=PanelView())
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if after.channel and after.channel.id == LOBBY_CHANNEL_ID:
+        try:
+            await create_room(member)
+        except Exception as e:
+            print("create_room error:", e)
+    if before.channel and before.channel.id in store.rooms and not before.channel.members:
+        store.rooms.pop(before.channel.id, None)
+        store.save()
+        try:
+            await before.channel.delete()
+        except Exception:
+            pass
+
+
+@bot.event
+async def on_ready():
+    for cid in list(store.rooms):
+        ch = bot.get_channel(cid)
+        if ch is None:
+            store.rooms.pop(cid)
+        elif not ch.members:
+            store.rooms.pop(cid)
+            try:
+                await ch.delete()
+            except Exception:
+                pass
+    store.save()
+    print(f"พร้อมใช้งาน: {bot.user}")
+
+
+# ----- คำสั่งข้อความ (prefix) -----
+async def owned_room(ctx):
+    v = ctx.author.voice
+    if not v or not v.channel or store.rooms.get(v.channel.id) != ctx.author.id:
+        await ctx.send("ต้องอยู่ในห้องส่วนตัวของคุณเองก่อน")
+        return None
+    return v.channel
+
+
+def room_cmd(*names):
+    def deco(fn):
+        return bot.hybrid_command(name=names[0], aliases=list(names[1:]),
+                                  description=f"คำสั่งห้องส่วนตัว: {names[0]}")(fn)
+    return deco
+
+
+@room_cmd("vpermit", "vgrant")
+async def c_grant(ctx, member: discord.Member):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_grant(ch, ctx.author.id, member))
+
+
+@room_cmd("vkick")
+async def c_kick(ctx, member: discord.Member):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_kick(ch, ctx.author.id, member))
+
+
+@room_cmd("vban")
+async def c_ban(ctx, member: discord.Member):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_ban(ch, ctx.author.id, member))
+
+
+@room_cmd("vunban")
+async def c_unban(ctx, member: discord.Member):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_unban(ch, ctx.author.id, member))
+
+
+@room_cmd("vbanlist")
+async def c_banlist(ctx):
+    bans = store.profile(ctx.author.id)["bans"]
+    await ctx.send("⛔ รายชื่อที่แบน:\n" + ("\n".join(f"• <@{u}> | {u}" for u in bans) if bans else "ไม่มี"))
+
+
+@room_cmd("vlock")
+async def c_lock(ctx):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_lock(ch, True))
+
+
+@room_cmd("vunlock")
+async def c_unlock(ctx):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_lock(ch, False))
+
+
+@room_cmd("vghost", "vhide")
+async def c_hide(ctx):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_hide(ch, True))
+
+
+@room_cmd("vunghost", "vunhide", "vshow")
+async def c_show(ctx):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_hide(ch, False))
+
+
+@room_cmd("vlimit")
+async def c_limit(ctx, n: int):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_limit(ch, ctx.author.id, n))
+
+
+@room_cmd("vname")
+async def c_name(ctx, *, name: str):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_name(ch, ctx.author.id, name))
+
+
+@room_cmd("vstatus")
+async def c_status(ctx, *, text: str):
+    if ch := await owned_room(ctx):
+        await ctx.send(await act_status(ch, ctx.author.id, text))
+
+
+@bot.event
+async def on_command_error(ctx, err):
+    if isinstance(err, (commands.CheckFailure, commands.MissingPermissions)):
+        return await ctx.send("คุณไม่มีสิทธิ์ใช้คำสั่งนี้")
+    if isinstance(err, (commands.MissingRequiredArgument, commands.BadArgument)):
+        return await ctx.send("ใส่ข้อมูลไม่ครบหรือไม่ถูกต้อง เช่น `!vgrant @เพื่อน`")
+    print("error:", err)
+
+
+bot.run(TOKEN)
