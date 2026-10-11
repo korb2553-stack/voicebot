@@ -21,9 +21,10 @@ TOKEN = load_token()
 PREFIX = "!"
 
 # ยศที่ใช้คำสั่งทีมงาน และยศที่ถูกข้าม ตั้งจากในดิสด้วย /ตั้งค่ายศ (เฉพาะแอดมิน)
-LOBBY_CHANNEL_ID = 0        # ห้องเสียงที่กดเข้าเพื่อสร้างห้องส่วนตัว
-ROOM_CATEGORY_ID = 0        # หมวดหมู่ที่สร้างห้อง (0 = หมวดเดียวกับ lobby)
+# ห้อง lobby และหมวดหมู่ที่สร้างห้อง ตั้งจากในดิสด้วย /ตั้งค่าห้อง (เฉพาะแอดมิน)
 DATA_FILE = "vroom_data.json"
+STREAM_TEXT = "องค์กรลับ พร้อมใช้งาน ♻️"                # ข้อความสถานะสตรีมมิ่ง
+STREAM_URL = "https://www.twitch.tv/discord"          # ต้องเป็นลิงก์ twitch/youtube ถึงจะขึ้นสีม่วง
 # ==================================================
 
 intents = discord.Intents.default()
@@ -37,7 +38,7 @@ class Store:
     def __init__(self):
         self.rooms = {}      # channel_id -> owner_id
         self.users = {}      # owner_id -> {name, limit, status, bans}
-        self.config = {"staff_roles": [], "protected_roles": []}
+        self.config = {"staff_roles": [], "protected_roles": [], "lobby": 0, "category": 0}
         self.load()
 
     def load(self):
@@ -204,6 +205,49 @@ class RoleSettingsView(discord.ui.View):
 @commands.guild_only()
 async def set_roles(ctx):
     await ctx.send(embed=settings_embed(ctx.guild), view=RoleSettingsView(ctx.guild))
+
+
+def room_settings_embed(guild):
+    lobby = guild.get_channel(store.config["lobby"])
+    cat = guild.get_channel(store.config["category"])
+    e = discord.Embed(title="⚙️ ตั้งค่าห้องส่วนตัว", color=discord.Color.blurple())
+    e.add_field(name="🎤 ห้อง lobby (กดเข้าเพื่อสร้างห้อง)", value=lobby.mention if lobby else "ยังไม่ได้ตั้ง", inline=False)
+    e.add_field(name="📁 หมวดหมู่ที่สร้างห้อง", value=cat.mention if cat else "หมวดเดียวกับ lobby", inline=False)
+    return e
+
+
+class RoomSettingsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        lobby = discord.ui.ChannelSelect(placeholder="เลือกห้อง lobby (ห้องเสียง)",
+                                         channel_types=[discord.ChannelType.voice], row=0)
+        cat = discord.ui.ChannelSelect(placeholder="เลือกหมวดหมู่ที่สร้างห้อง (ไม่เลือก = หมวดเดียวกับ lobby)",
+                                       channel_types=[discord.ChannelType.category],
+                                       min_values=0, max_values=1, row=1)
+        lobby.callback = self.make_cb("lobby", lobby)
+        cat.callback = self.make_cb("category", cat)
+        self.add_item(lobby)
+        self.add_item(cat)
+
+    def make_cb(self, key, sel):
+        async def cb(i: discord.Interaction):
+            store.config[key] = sel.values[0].id if sel.values else 0
+            store.save()
+            await i.response.edit_message(embed=room_settings_embed(i.guild))
+        return cb
+
+    async def interaction_check(self, i: discord.Interaction):
+        if not i.user.guild_permissions.administrator:
+            await i.response.send_message("เฉพาะแอดมินเท่านั้น", ephemeral=True)
+            return False
+        return True
+
+
+@bot.hybrid_command(name="ตั้งค่าห้อง", description="ตั้งห้อง lobby และหมวดหมู่ของห้องส่วนตัว (แอดมินเท่านั้น)")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def set_rooms(ctx):
+    await ctx.send(embed=room_settings_embed(ctx.guild), view=RoomSettingsView())
 
 
 # ===================== ส่วนที่ 2: ห้องส่วนตัว =====================
@@ -415,8 +459,8 @@ class PanelView(discord.ui.View):
 # ----- สร้าง / ลบห้องอัตโนมัติ -----
 async def create_room(member):
     guild = member.guild
-    lobby = guild.get_channel(LOBBY_CHANNEL_ID)
-    cat = guild.get_channel(ROOM_CATEGORY_ID) if ROOM_CATEGORY_ID else lobby.category
+    lobby = guild.get_channel(store.config["lobby"])
+    cat = guild.get_channel(store.config["category"]) if store.config["category"] else lobby.category
     prof = store.profile(member.id)
     ow = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),  # สร้างแบบล็อค+ซ่อนเสมอ
@@ -441,7 +485,7 @@ async def create_room(member):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if after.channel and after.channel.id == LOBBY_CHANNEL_ID:
+    if after.channel and store.config["lobby"] and after.channel.id == store.config["lobby"]:
         try:
             await create_room(member)
         except Exception as e:
@@ -468,6 +512,7 @@ async def on_ready():
             except Exception:
                 pass
     store.save()
+    await bot.change_presence(activity=discord.Streaming(name=STREAM_TEXT, url=STREAM_URL))
     print(f"พร้อมใช้งาน: {bot.user}")
 
 
