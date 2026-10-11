@@ -350,12 +350,12 @@ async def act_unban(ch, owner_id, member):
 
 
 def panel_embed(owner, ch):
-    e = discord.Embed(color=discord.Color.blurple())
-    e.set_author(name=f"ห้องของ {owner.display_name}", icon_url=owner.display_avatar.url)
+    e = discord.Embed(title=f"🎶 ห้องของ {owner.display_name}", color=discord.Color.blurple())
     e.add_field(name="👑 เจ้าของ", value=owner.mention)
     e.add_field(name="🔐 การเข้าถึง", value="🔒 ล็อค" if is_locked(ch) else "🔓 ปลดล็อค")
     e.add_field(name="👀 การมองเห็น", value="🙈 ซ่อน" if is_hidden(ch) else "👁️ แสดง")
     e.add_field(name="👥 จำนวนคน", value=f"{len(ch.members)} / {ch.user_limit or 'ไม่จำกัด'}")
+    e.set_image(url=owner.display_avatar.replace(size=512).url)
     e.set_footer(text="กดปุ่มด้านล่างเพื่อจัดการห้องของคุณ • เจ้าของห้องเท่านั้น")
     return e
 
