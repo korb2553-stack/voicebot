@@ -605,6 +605,61 @@ async def c_status(ctx, *, text: str):
         await ctx.send(await act_status(ch, ctx.author.id, text))
 
 
+
+
+@bot.hybrid_command(name="ย้าย", description="ย้ายทุกคนจากห้องต้นทางไปห้องปลายทาง เช่น !ย้าย 123 to 456")
+@is_staff()
+@commands.guild_only()
+async def move_all(ctx, from_id: str, _to: str = None, to_id: str = None):
+    # รองรับทั้ง  !ย้าย <from> to <to>  และ  !ย้าย <from> <to>
+    if to_id is None:
+        if _to and _to.isdigit():
+            to_id = _to
+        else:
+            return await ctx.send("รูปแบบคำสั่ง: `!ย้าย <ไอดีห้องต้นทาง> to <ไอดีห้องปลายทาง>`")
+    if not from_id.isdigit() or not to_id.isdigit():
+        return await ctx.send("ไอดีห้องต้องเป็นตัวเลขเท่านั้น")
+    src = ctx.guild.get_channel(int(from_id))
+    dst = ctx.guild.get_channel(int(to_id))
+    if src is None:
+        return await ctx.send(f"ไม่พบห้องต้นทาง `{from_id}`")
+    if dst is None:
+        return await ctx.send(f"ไม่พบห้องปลายทาง `{to_id}`")
+    if not isinstance(src, discord.VoiceChannel) or not isinstance(dst, discord.VoiceChannel):
+        return await ctx.send("ต้องเป็นห้องเสียงเท่านั้น")
+    if ctx.interaction:
+        await ctx.defer()
+    t0 = time.perf_counter()
+    ok, protected = [], []
+    for m in list(src.members):
+        if m.bot:
+            continue
+        (protected if has_protected(m) else ok).append(m)
+    results = await asyncio.gather(*[m.move_to(dst) for m in ok], return_exceptions=True)
+    moved = [m for m, r in zip(ok, results) if not isinstance(r, Exception)]
+    failed = [m for m, r in zip(ok, results) if isinstance(r, Exception)]
+    secs = time.perf_counter() - t0
+    moved_lines = "\n".join(f"• {m.mention} | **{m.display_name}** | {m.id}" for m in moved)
+    prot_lines = "\n".join(f"• {m.display_name}" for m in protected)
+    desc_parts = [
+        f"📢 ห้องต้นทาง\n{src.mention}  ( {src.id} )",
+        f"📥 ห้องปลายทาง\n{dst.mention}  ( {dst.id} )",
+        f"✅ **ย้ายสำเร็จ ({len(moved)} คน)**\n{moved_lines}" if moved else "✅ ไม่มีคนให้ย้าย",
+    ]
+    if protected:
+        desc_parts.append(f"🛡️ **ข้าม (มี role) ({len(protected)} คน)**\n{prot_lines}")
+    if failed:
+        desc_parts.append(f"❌ **ไม่สำเร็จ ({len(failed)} คน)**")
+    embed = discord.Embed(
+        title="📣 รายงาน Recall",
+        description="\n\n".join(desc_parts)[:4000],
+        color=discord.Color.yellow(),
+    )
+    embed.set_footer(text=f"⚡ เวลาที่ใช้: {secs:.2f} วินาที")
+    await ctx.send(embed=embed)
+
+
+
 @bot.event
 async def on_command_error(ctx, err):
     if isinstance(err, (commands.CheckFailure, commands.MissingPermissions)):
