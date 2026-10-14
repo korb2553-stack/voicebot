@@ -24,6 +24,13 @@ ACTION_META = {
 }
 
 
+_server_info: dict = {"name": "Discord Server", "icon": None}
+
+def set_server_info(name: str, icon: str | None):
+    _server_info["name"] = name
+    _server_info["icon"] = icon
+
+
 class LogStore:
     def __init__(self):
         self.entries: list[dict] = []
@@ -80,7 +87,7 @@ body{background:var(--bg);color:var(--text);font-family:'Noto Sans Thai',sans-se
 /* header */
 header{background:linear-gradient(135deg,#1a0533 0%,#0d1117 60%);border-bottom:1px solid #3b1f6b;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;gap:12px;flex-wrap:wrap}
 .hgroup{display:flex;align-items:center;gap:14px}
-.server-badge{width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;letter-spacing:.5px;flex-shrink:0}
+.server-badge{width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,#8b5cf6,#6d28d9);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;letter-spacing:.5px;flex-shrink:0;overflow:hidden}.server-badge img{width:44px;height:44px;object-fit:cover;border-radius:12px}
 .htitle h1{font-size:14px;font-weight:700;letter-spacing:.08em;color:#c4b5fd;text-transform:uppercase}
 .htitle .sub{font-size:12px;color:var(--muted);margin-top:2px;display:flex;align-items:center;gap:6px}
 .live-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:pulse 2s infinite}
@@ -117,9 +124,9 @@ main{padding:12px 20px;display:flex;flex-direction:column;gap:8px;max-width:900p
 <body>
 <header>
   <div class="hgroup">
-    <div class="server-badge">KN</div>
+    <div class="server-badge" id="srv-icon"><span id="srv-init">KN</span></div>
     <div class="htitle">
-      <h1>Voice Audit Log</h1>
+      <h1 id="srv-name">Voice Audit Log</h1>
       <div class="sub"><span class="live-dot"></span><span id="status">กำลังโหลด...</span></div>
     </div>
   </div>
@@ -190,12 +197,23 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   cat = t.dataset.cat;
   load();
 }));
+fetch('/api/server').then(r=>r.json()).then(d=>{
+  if(d.name) document.getElementById('srv-name').textContent=d.name+' — Voice Audit Log';
+  if(d.icon){
+    const el=document.getElementById('srv-icon');
+    el.innerHTML=`<img src="${d.icon}" alt="server icon">`;
+  }
+}).catch(()=>{});
 load(); setInterval(load, 5000);
 </script>
 </body></html>"""
 
 
 # ─── Web Server ─────────────────────────────────────────────────────────
+async def _handle_server(req):
+    return web.json_response(_server_info)
+
+
 async def _handle_index(req):
     return web.Response(text=_HTML, content_type="text/html")
 
@@ -210,6 +228,7 @@ async def start(port: int = None):
     port = port or int(os.getenv("SERVER_PORT", "8080"))
     app  = web.Application()
     app.router.add_get("/", _handle_index)
+    app.router.add_get("/api/server", _handle_server)
     app.router.add_get("/api/logs", _handle_api)
     runner = web.AppRunner(app)
     await runner.setup()
