@@ -1,5 +1,6 @@
 import os
 import json
+import weblog
 import time
 import asyncio
 import discord
@@ -65,6 +66,7 @@ store = Store()
 class VoiceBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(PanelView())
+        await weblog.start()
         try:
             await self.tree.sync()
         except Exception as e:
@@ -122,6 +124,15 @@ async def mass_voice(ctx, mode):
     results = await asyncio.gather(*[do(m) for m in todo], return_exceptions=True)
     for m, r in zip(todo, results):
         (failed if isinstance(r, Exception) else ok).append(m)
+    _action = {"mute":"mute","unmute":"unmute"}.get(mode,"disconnect")
+    _desc   = {"mute":f"ไมค์แดง {len(ok)} คน ใน {vc.name}",
+                "unmute":f"ปลดไมค์ {len(ok)} คน ใน {vc.name}",
+                "disconnect":f"ตัดหมด {len(ok)} คน ใน {vc.name}"}[mode]
+    weblog.log_store.add(_action,
+        staff_name=ctx.author.display_name, staff_id=str(ctx.author.id),
+        channel=vc.name, channel_id=str(vc.id),
+        count=len(ok), members=[{"id":str(m.id),"name":m.display_name} for m in ok],
+        desc=_desc)
 
     secs = time.perf_counter() - t0
     if mode == "disconnect":
@@ -478,11 +489,28 @@ async def create_room(member):
         category=cat, user_limit=prof["limit"], overwrites=ow)
     store.rooms[ch.id] = member.id
     store.save()
+    weblog.log_store.add("room_create",
+        user_name=member.display_name, user_id=str(member.id),
+        channel=ch.name, channel_id=str(ch.id),
+        desc=f"สร้างห้อง {ch.name}")
     await member.move_to(ch)
     if prof["status"]:
         await act_status(ch, member.id, prof["status"])
     await ch.send(embed=panel_embed(member, ch), view=PanelView())
 
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type == discord.InteractionType.application_command:
+        ch_name = getattr(interaction.channel, "name", "DM") if interaction.channel else "DM"
+        cmd_name = interaction.data.get("name","?")
+        weblog.log_store.add("cmd",
+            user_name=interaction.user.display_name,
+            user_id=str(interaction.user.id),
+            channel=ch_name,
+            channel_id=str(interaction.channel_id or ""),
+            desc=f"/{cmd_name}")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -491,9 +519,36 @@ async def on_voice_state_update(member, before, after):
             await create_room(member)
         except Exception as e:
             print("create_room error:", e)
+    elif after.channel and before.channel is None:
+        # join (not lobby)
+        weblog.log_store.add("join",
+            user_name=member.display_name, user_id=str(member.id),
+            channel=after.channel.name, channel_id=str(after.channel.id),
+            member_count=len(after.channel.members),
+            desc=f"เข้าห้อง {after.channel.name} ({len(after.channel.members)} คน)")
+    elif before.channel and after.channel is None:
+        # leave (non-private)
+        if before.channel.id not in store.rooms:
+            weblog.log_store.add("leave",
+                user_name=member.display_name, user_id=str(member.id),
+                channel=before.channel.name, channel_id=str(before.channel.id),
+                member_count=len(before.channel.members),
+                desc=f"ออกจากห้อง {before.channel.name} ({len(before.channel.members)} คน)")
+    elif before.channel and after.channel and before.channel != after.channel:
+        if after.channel.id != store.config.get("lobby",0):
+            weblog.log_store.add("move",
+                user_name=member.display_name, user_id=str(member.id),
+                channel=after.channel.name, channel_id=str(after.channel.id),
+                src_channel=before.channel.name, dst_channel=after.channel.name,
+                member_count=len(after.channel.members),
+                desc=f"ย้ายจาก {before.channel.name} → {after.channel.name}")
     if before.channel and before.channel.id in store.rooms and not before.channel.members:
+        cname=before.channel.name
         store.rooms.pop(before.channel.id, None)
         store.save()
+        weblog.log_store.add("room_delete",
+            channel=cname, channel_id=str(before.channel.id),
+            desc=f"ลบห้อง {cname} (ว่าง)")
         try:
             await before.channel.delete()
         except Exception:
@@ -515,6 +570,7 @@ async def on_ready():
     store.save()
     await bot.change_presence(activity=discord.Streaming(name=STREAM_TEXT, url=STREAM_URL))
     print(f"พร้อมใช้งาน: {bot.user}")
+    bot.tree.interaction_check = None
 
 
 # ----- คำสั่งข้อความ (prefix) -----
@@ -622,6 +678,11 @@ async def _do_move(guild, src, dst, ctx_or_interaction):
     results = await asyncio.gather(*[m.move_to(dst) for m in ok], return_exceptions=True)
     moved  = [m for m, r in zip(ok, results) if not isinstance(r, Exception)]
     failed = [m for m, r in zip(ok, results) if     isinstance(r, Exception)]
+    weblog.log_store.add("recall",
+        src_channel=src.name, dst_channel=dst.name,
+        channel=src.name, channel_id=str(src.id),
+        count=len(moved), members=[{"id":str(m.id),"name":m.display_name} for m in moved],
+        desc=f"Recall: {src.name} → {dst.name} (ย้าย {len(moved)} คน)")
     secs = _time.perf_counter() - t0
     moved_lines = "\n".join(f"• {m.mention} | **{m.display_name}** | {m.id}" for m in moved)
     prot_lines  = "\n".join(f"• {m.display_name}" for m in protected)
@@ -725,6 +786,93 @@ async def move_slash(i: discord.Interaction):
         view=MoveView(),
         ephemeral=True,
     )
+
+
+
+
+# ─── บันทึก ban / timeout / คำสั่ง ────────────────────────────────────────
+@bot.event
+async def on_member_ban(guild, user):
+    staff_name = "ไม่ทราบ"
+    try:
+        async for e in guild.audit_logs(limit=3, action=discord.AuditLogAction.ban):
+            if e.target and e.target.id == user.id:
+                staff_name = e.user.display_name
+                break
+    except Exception:
+        pass
+    weblog.log_store.add("ban",
+        user_name=getattr(user, "display_name", user.name),
+        user_id=str(user.id),
+        staff_name=staff_name,
+        desc=f"แบน {getattr(user, 'display_name', user.name)} (โดย {staff_name})")
+
+
+@bot.event
+async def on_member_unban(guild, user):
+    staff_name = "ไม่ทราบ"
+    try:
+        async for e in guild.audit_logs(limit=3, action=discord.AuditLogAction.unban):
+            if e.target and e.target.id == user.id:
+                staff_name = e.user.display_name
+                break
+    except Exception:
+        pass
+    weblog.log_store.add("unban",
+        user_name=getattr(user, "display_name", user.name),
+        user_id=str(user.id),
+        staff_name=staff_name,
+        desc=f"ปลดแบน {getattr(user, 'display_name', user.name)} (โดย {staff_name})")
+
+
+@bot.event
+async def on_member_update(before, after):
+    if before.timed_out_until == after.timed_out_until:
+        return
+    if after.timed_out_until:
+        staff_name = "ไม่ทราบ"
+        try:
+            async for e in after.guild.audit_logs(limit=3, action=discord.AuditLogAction.member_update):
+                if e.target and e.target.id == after.id:
+                    staff_name = e.user.display_name
+                    break
+        except Exception:
+            pass
+        until = after.timed_out_until.strftime("%d/%m %H:%M")
+        weblog.log_store.add("timeout",
+            user_name=after.display_name, user_id=str(after.id),
+            staff_name=staff_name,
+            desc=f"หมดเวลา {after.display_name} จนถึง {until} (โดย {staff_name})")
+    else:
+        weblog.log_store.add("untimeout",
+            user_name=after.display_name, user_id=str(after.id),
+            desc=f"ยกเลิกหมดเวลา {after.display_name}")
+
+
+@bot.before_invoke
+async def log_cmd(ctx):
+    ch_name = getattr(ctx.channel, "name", "DM")
+    weblog.log_store.add("cmd",
+        user_name=ctx.author.display_name, user_id=str(ctx.author.id),
+        channel=ch_name, channel_id=str(ctx.channel.id),
+        desc=f"!{ctx.command.qualified_name}")
+
+
+@bot.tree.error
+async def on_app_error(i: discord.Interaction, err):
+    pass  # suppress unhandled slash errors from logging noise
+
+
+async def _log_slash(i: discord.Interaction, cmd):
+    if i.user.bot:
+        return
+    ch_name = getattr(i.channel, "name", "DM")
+    weblog.log_store.add("cmd",
+        user_name=i.user.display_name, user_id=str(i.user.id),
+        channel=ch_name, channel_id=str(i.channel_id or ""),
+        desc=f"/{cmd.name}")
+
+bot.tree.on_error = on_app_error
 
 
 
