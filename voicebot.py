@@ -1,6 +1,7 @@
 import os
 import json
 import weblog
+import hashlib
 import time
 import asyncio
 import discord
@@ -128,10 +129,14 @@ async def mass_voice(ctx, mode):
     _desc   = {"mute":f"ไมค์แดง {len(ok)} คน ใน {vc.name}",
                 "unmute":f"ปลดไมค์ {len(ok)} คน ใน {vc.name}",
                 "disconnect":f"ตัดหมด {len(ok)} คน ใน {vc.name}"}[mode]
-    weblog.log_store.add(_action,
+    weblog.log_store.add(str(ctx.guild.id),_action,
+        actor_name=ctx.author.display_name, actor_id=str(ctx.author.id),
+        actor_avatar=str(ctx.author.display_avatar.url),
         staff_name=ctx.author.display_name, staff_id=str(ctx.author.id),
         channel=vc.name, channel_id=str(vc.id),
-        count=len(ok), members=[{"id":str(m.id),"name":m.display_name} for m in ok],
+        count=len(ok),
+        members=[{"id":str(m.id),"name":m.display_name,
+                  "avatar":str(m.display_avatar.url)} for m in ok],
         desc=_desc)
 
     secs = time.perf_counter() - t0
@@ -489,7 +494,9 @@ async def create_room(member):
         category=cat, user_limit=prof["limit"], overwrites=ow)
     store.rooms[ch.id] = member.id
     store.save()
-    weblog.log_store.add("room_create",
+    weblog.log_store.add(str(member.guild.id),"room_create",
+        actor_name=member.display_name, actor_id=str(member.id),
+        actor_avatar=str(member.display_avatar.url),
         user_name=member.display_name, user_id=str(member.id),
         channel=ch.name, channel_id=str(ch.id),
         desc=f"สร้างห้อง {ch.name}")
@@ -505,7 +512,10 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.application_command:
         ch_name = getattr(interaction.channel, "name", "DM") if interaction.channel else "DM"
         cmd_name = interaction.data.get("name", "?")
-        weblog.log_store.add("cmd",
+        weblog.log_store.add(str(interaction.guild_id) if interaction.guild_id else "dm","cmd",
+            actor_name=interaction.user.display_name,
+            actor_id=str(interaction.user.id),
+            actor_avatar=str(interaction.user.display_avatar.url),
             user_name=interaction.user.display_name,
             user_id=str(interaction.user.id),
             channel=ch_name,
@@ -515,6 +525,35 @@ async def on_interaction(interaction: discord.Interaction):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    # ตรวจ server mute/deafen เปลี่ยนแปลง
+    if before.channel or after.channel:
+        if before.mute != after.mute:
+            act = "server_mute" if after.mute else "server_unmute"
+            auditor = await _fetch_auditor(member.guild,
+                discord.AuditLogAction.member_update, member.id)
+            sname = auditor.display_name if auditor else "ไม่ทราบ"
+            sav = str(auditor.display_avatar.url) if auditor else None
+            weblog.log_store.add(str(member.guild.id), act,
+                actor_name=sname, actor_avatar=sav,
+                target_name=member.display_name, target_id=str(member.id),
+                target_avatar=str(member.display_avatar.url),
+                user_name=member.display_name, user_id=str(member.id),
+                channel=(after.channel or before.channel).name if (after.channel or before.channel) else None,
+                desc=f"{'ปิด' if after.mute else 'เปิด'}ไมค์แดง {member.display_name} (โดย {sname})")
+        if before.deaf != after.deaf:
+            act2 = "server_deaf" if after.deaf else "server_undeaf"
+            auditor2 = await _fetch_auditor(member.guild,
+                discord.AuditLogAction.member_update, member.id)
+            sname2 = auditor2.display_name if auditor2 else "ไม่ทราบ"
+            sav2 = str(auditor2.display_avatar.url) if auditor2 else None
+            weblog.log_store.add(str(member.guild.id), act2,
+                actor_name=sname2, actor_avatar=sav2,
+                target_name=member.display_name, target_id=str(member.id),
+                target_avatar=str(member.display_avatar.url),
+                user_name=member.display_name, user_id=str(member.id),
+                channel=(after.channel or before.channel).name if (after.channel or before.channel) else None,
+                desc=f"{'ปิด' if after.deaf else 'เปิด'}หู {member.display_name} (โดย {sname2})")
+
     if after.channel and store.config["lobby"] and after.channel.id == store.config["lobby"]:
         try:
             await create_room(member)
@@ -522,7 +561,9 @@ async def on_voice_state_update(member, before, after):
             print("create_room error:", e)
     elif after.channel and before.channel is None:
         # join (not lobby)
-        weblog.log_store.add("join",
+        weblog.log_store.add(str(member.guild.id),"join",
+            actor_name=member.display_name, actor_id=str(member.id),
+            actor_avatar=str(member.display_avatar.url),
             user_name=member.display_name, user_id=str(member.id),
             channel=after.channel.name, channel_id=str(after.channel.id),
             member_count=len(after.channel.members),
@@ -530,30 +571,91 @@ async def on_voice_state_update(member, before, after):
     elif before.channel and after.channel is None:
         # leave (non-private)
         if before.channel.id not in store.rooms:
-            weblog.log_store.add("leave",
+            weblog.log_store.add(str(member.guild.id),"leave",
+                actor_name=member.display_name, actor_id=str(member.id),
+                actor_avatar=str(member.display_avatar.url),
                 user_name=member.display_name, user_id=str(member.id),
                 channel=before.channel.name, channel_id=str(before.channel.id),
                 member_count=len(before.channel.members),
                 desc=f"ออกจากห้อง {before.channel.name} ({len(before.channel.members)} คน)")
     elif before.channel and after.channel and before.channel != after.channel:
         if after.channel.id != store.config.get("lobby",0):
-            weblog.log_store.add("move",
+            weblog.log_store.add(str(member.guild.id),"move",
+                actor_name=member.display_name, actor_id=str(member.id),
+                actor_avatar=str(member.display_avatar.url),
                 user_name=member.display_name, user_id=str(member.id),
-                channel=after.channel.name, channel_id=str(after.channel.id),
                 src_channel=before.channel.name, dst_channel=after.channel.name,
+                channel=after.channel.name, channel_id=str(after.channel.id),
                 member_count=len(after.channel.members),
                 desc=f"ย้ายจาก {before.channel.name} → {after.channel.name}")
     if before.channel and before.channel.id in store.rooms and not before.channel.members:
         cname=before.channel.name
         store.rooms.pop(before.channel.id, None)
         store.save()
-        weblog.log_store.add("room_delete",
+        weblog.log_store.add(str(before.channel.guild.id),"room_delete",
             channel=cname, channel_id=str(before.channel.id),
             desc=f"ลบห้อง {cname} (ว่าง)")
         try:
             await before.channel.delete()
         except Exception:
             pass
+
+
+
+# ─── ตรวจ server mute / deafen รายคน ──────────────────────────────────────
+_mute_cache: dict[int, bool] = {}
+_deaf_cache: dict[int, bool] = {}
+
+
+async def _fetch_auditor(guild, action, target_id):
+    try:
+        async for e in guild.audit_logs(limit=3, action=action):
+            if e.target and e.target.id == target_id:
+                return e.user
+    except Exception:
+        pass
+    return None
+
+
+# ─── ลบ / แก้ไข ข้อความ ────────────────────────────────────────────────────
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or not message.guild:
+        return
+    att_url = None
+    for a in message.attachments:
+        if any(a.filename.lower().endswith(x) for x in (".png",".jpg",".jpeg",".gif",".webp")):
+            att_url = weblog.cached_img_url(a.id, a.url); break
+    weblog.log_store.add(str(message.guild.id), "msg_delete",
+        actor_name=message.author.display_name,
+        actor_id=str(message.author.id),
+        actor_avatar=str(message.author.display_avatar.url),
+        user_name=message.author.display_name,
+        user_id=str(message.author.id),
+        channel=message.channel.name,
+        channel_id=str(message.channel.id),
+        content=message.content[:1000] if message.content else None,
+        attachment_url=att_url,
+        desc=f"ลบข้อความใน #{message.channel.name}")
+
+
+@bot.event
+async def on_message_edit(before, after):
+    if before.author.bot or not before.guild:
+        return
+    if before.content == after.content:
+        return
+    weblog.log_store.add(str(before.guild.id), "msg_edit",
+        actor_name=before.author.display_name,
+        actor_id=str(before.author.id),
+        actor_avatar=str(before.author.display_avatar.url),
+        user_name=before.author.display_name,
+        user_id=str(before.author.id),
+        channel=before.channel.name,
+        channel_id=str(before.channel.id),
+        before=before.content[:800] if before.content else None,
+        after=after.content[:800] if after.content else None,
+        desc=f"แก้ไขข้อความใน #{before.channel.name}")
 
 
 @bot.event
@@ -571,9 +673,7 @@ async def on_ready():
     store.save()
     await bot.change_presence(activity=discord.Streaming(name=STREAM_TEXT, url=STREAM_URL))
     for g in bot.guilds:
-        icon_url = str(g.icon.url) if g.icon else None
-        weblog.set_server_info(g.name, icon_url)
-        break  # ใช้เซิร์ฟเวอร์แรก
+        weblog.set_server(str(g.id), g.name, str(g.icon.url) if g.icon else None)
     print(f"พร้อมใช้งาน: {bot.user}")
 
 
@@ -682,10 +782,12 @@ async def _do_move(guild, src, dst, ctx_or_interaction):
     results = await asyncio.gather(*[m.move_to(dst) for m in ok], return_exceptions=True)
     moved  = [m for m, r in zip(ok, results) if not isinstance(r, Exception)]
     failed = [m for m, r in zip(ok, results) if     isinstance(r, Exception)]
-    weblog.log_store.add("recall",
+    weblog.log_store.add(str(guild.id),"recall",
         src_channel=src.name, dst_channel=dst.name,
         channel=src.name, channel_id=str(src.id),
-        count=len(moved), members=[{"id":str(m.id),"name":m.display_name} for m in moved],
+        count=len(moved),
+        members=[{"id":str(m.id),"name":m.display_name,
+                  "avatar":str(m.display_avatar.url)} for m in moved],
         desc=f"Recall: {src.name} → {dst.name} (ย้าย {len(moved)} คน)")
     secs = _time.perf_counter() - t0
     moved_lines = "\n".join(f"• {m.mention} | **{m.display_name}** | {m.id}" for m in moved)
@@ -805,11 +907,11 @@ async def on_member_ban(guild, user):
                 break
     except Exception:
         pass
-    weblog.log_store.add("ban",
-        user_name=getattr(user, "display_name", user.name),
-        user_id=str(user.id),
-        staff_name=staff_name,
-        desc=f"แบน {getattr(user, 'display_name', user.name)} (โดย {staff_name})")
+    uname=getattr(user,"display_name",user.name)
+    weblog.log_store.add(str(guild.id),"ban",
+        actor_name=staff_name, target_name=uname, target_id=str(user.id),
+        user_name=uname, user_id=str(user.id),
+        desc=f"แบน {uname} (โดย {staff_name})")
 
 
 @bot.event
@@ -822,15 +924,50 @@ async def on_member_unban(guild, user):
                 break
     except Exception:
         pass
-    weblog.log_store.add("unban",
-        user_name=getattr(user, "display_name", user.name),
-        user_id=str(user.id),
-        staff_name=staff_name,
-        desc=f"ปลดแบน {getattr(user, 'display_name', user.name)} (โดย {staff_name})")
+    uname2=getattr(user,"display_name",user.name)
+    weblog.log_store.add(str(guild.id),"unban",
+        actor_name=staff_name, target_name=uname2, target_id=str(user.id),
+        user_name=uname2, user_id=str(user.id),
+        desc=f"ปลดแบน {uname2} (โดย {staff_name})")
 
 
 @bot.event
 async def on_member_update(before, after):
+    # ── role changes ──
+    added = set(after.roles) - set(before.roles)
+    removed = set(before.roles) - set(after.roles)
+    if added or removed:
+        auditor, av_url = None, None
+        try:
+            async for e in after.guild.audit_logs(limit=3, action=discord.AuditLogAction.member_role_update):
+                if e.target and e.target.id == after.id:
+                    auditor = e.user; av_url = str(e.user.display_avatar.url); break
+        except Exception:
+            pass
+        sname = auditor.display_name if auditor else "ไม่ทราบ"
+        for r in added:
+            weblog.log_store.add(str(after.guild.id),"role_add",
+                actor_name=sname, actor_avatar=av_url,
+                target_name=after.display_name, target_id=str(after.id),
+                target_avatar=str(after.display_avatar.url),
+                user_name=after.display_name, user_id=str(after.id),
+                desc=f"ให้ยศ @{r.name} แก่ {after.display_name} (โดย {sname})")
+        for r in removed:
+            weblog.log_store.add(str(after.guild.id),"role_remove",
+                actor_name=sname, actor_avatar=av_url,
+                target_name=after.display_name, target_id=str(after.id),
+                target_avatar=str(after.display_avatar.url),
+                user_name=after.display_name, user_id=str(after.id),
+                desc=f"เอาคืนยศ @{r.name} จาก {after.display_name} (โดย {sname})")
+    # ── nickname ──
+    if before.nick != after.nick:
+        weblog.log_store.add(str(after.guild.id),"nick_change",
+            actor_name=after.display_name, actor_id=str(after.id),
+            actor_avatar=str(after.display_avatar.url),
+            user_name=after.display_name, user_id=str(after.id),
+            before=before.nick or before.name,
+            after=after.nick or after.name,
+            desc=f"เปลี่ยนชื่อเล่น: {before.nick or before.name} → {after.nick or after.name}")
     if before.timed_out_until == after.timed_out_until:
         return
     if after.timed_out_until:
@@ -843,12 +980,18 @@ async def on_member_update(before, after):
         except Exception:
             pass
         until = after.timed_out_until.strftime("%d/%m %H:%M")
-        weblog.log_store.add("timeout",
+        weblog.log_store.add(str(after.guild.id),"timeout",
+            actor_name=staff_name,
+            actor_avatar=str(after.guild.get_member_named(staff_name).display_avatar.url) if after.guild.get_member_named(staff_name) else None,
+            target_name=after.display_name, target_id=str(after.id),
+            target_avatar=str(after.display_avatar.url),
             user_name=after.display_name, user_id=str(after.id),
             staff_name=staff_name,
             desc=f"หมดเวลา {after.display_name} จนถึง {until} (โดย {staff_name})")
     else:
-        weblog.log_store.add("untimeout",
+        weblog.log_store.add(str(after.guild.id),"untimeout",
+            target_name=after.display_name, target_id=str(after.id),
+            target_avatar=str(after.display_avatar.url),
             user_name=after.display_name, user_id=str(after.id),
             desc=f"ยกเลิกหมดเวลา {after.display_name}")
 
@@ -856,7 +999,9 @@ async def on_member_update(before, after):
 @bot.before_invoke
 async def log_cmd(ctx):
     ch_name = getattr(ctx.channel, "name", "DM")
-    weblog.log_store.add("cmd",
+    weblog.log_store.add(str(ctx.guild.id) if ctx.guild else "dm","cmd",
+        actor_name=ctx.author.display_name, actor_id=str(ctx.author.id),
+        actor_avatar=str(ctx.author.display_avatar.url),
         user_name=ctx.author.display_name, user_id=str(ctx.author.id),
         channel=ch_name, channel_id=str(ctx.channel.id),
         desc=f"!{ctx.command.qualified_name}")
@@ -871,6 +1016,101 @@ async def on_command_error(ctx, err):
     if isinstance(err, (commands.MissingRequiredArgument, commands.BadArgument)):
         return await ctx.send("ใส่ข้อมูลไม่ครบหรือไม่ถูกต้อง เช่น `!vgrant @เพื่อน`")
     print("error:", err)
+
+
+
+# ─── pre-cache ภาพก่อนโดนลบ ────────────────────────────────────────────────
+@bot.event
+async def on_message(message):
+    if message.attachments and message.guild:
+        for att in message.attachments:
+            if any(att.filename.lower().endswith(x) for x in (".png",".jpg",".jpeg",".gif",".webp")):
+                asyncio.create_task(weblog.download_image(att.id, att.url))
+    await bot.process_commands(message)
+
+
+# ─── เข้า / ออกเซิร์ฟ ──────────────────────────────────────────────────────
+@bot.event
+async def on_member_join(member):
+    weblog.log_store.add(str(member.guild.id), "member_join",
+        actor_name=member.display_name, actor_id=str(member.id),
+        actor_avatar=str(member.display_avatar.url),
+        user_name=member.display_name, user_id=str(member.id),
+        desc=f"{member.display_name} เข้าเซิร์ฟเวอร์ ({member.guild.member_count} คน)")
+
+
+@bot.event
+async def on_member_remove(member):
+    # ตรวจว่าถูกเตะหรือออกเอง
+    action, staff_name, staff_av = "member_leave", None, None
+    try:
+        async for e in member.guild.audit_logs(limit=3, action=discord.AuditLogAction.kick):
+            if e.target and e.target.id == member.id and time.time()-e.created_at.timestamp()<5:
+                action = "member_kick"
+                staff_name = e.user.display_name
+                staff_av = str(e.user.display_avatar.url)
+                break
+    except Exception:
+        pass
+    weblog.log_store.add(str(member.guild.id), action,
+        actor_name=staff_name or member.display_name,
+        actor_avatar=staff_av or str(member.display_avatar.url),
+        target_name=member.display_name if staff_name else None,
+        target_id=str(member.id) if staff_name else None,
+        target_avatar=str(member.display_avatar.url) if staff_name else None,
+        user_name=member.display_name, user_id=str(member.id),
+        desc=(f"เตะ {member.display_name} (โดย {staff_name})"
+              if action=="member_kick" else f"{member.display_name} ออกเซิร์ฟเวอร์"))
+
+
+# ─── ยศ / ชื่อเล่นเปลี่ยน ────────────────────────────────────────────────────
+@bot.event
+async def on_member_role_change(before_m, after_m):
+    pass  # ใช้ on_member_update แทน — placeholder
+
+
+# ─── channel create / delete ────────────────────────────────────────────────
+@bot.event
+async def on_guild_channel_create(channel):
+    auditor, av_url = None, None
+    try:
+        async for e in channel.guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_create):
+            if e.target and e.target.id == channel.id:
+                auditor = e.user; av_url = str(e.user.display_avatar.url); break
+    except Exception:
+        pass
+    kind = {"text":"ข้อความ","voice":"เสียง","category":"หมวดหมู่"}.get(str(channel.type).split(".")[-1],"")
+    weblog.log_store.add(str(channel.guild.id), "ch_create",
+        actor_name=auditor.display_name if auditor else "ไม่ทราบ",
+        actor_avatar=av_url,
+        channel=channel.name,
+        desc=f"สร้างช่อง{kind} #{channel.name}")
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    auditor, av_url = None, None
+    try:
+        async for e in channel.guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_delete):
+            if e.target and e.target.id == channel.id:
+                auditor = e.user; av_url = str(e.user.display_avatar.url); break
+    except Exception:
+        pass
+    weblog.log_store.add(str(channel.guild.id), "ch_delete",
+        actor_name=auditor.display_name if auditor else "ไม่ทราบ",
+        actor_avatar=av_url,
+        channel=channel.name,
+        desc=f"ลบช่อง #{channel.name}")
+
+
+@bot.event
+async def on_guild_join(guild):
+    weblog.set_server(str(guild.id), guild.name, str(guild.icon.url) if guild.icon else None)
+
+
+@bot.event
+async def on_guild_remove(guild):
+    weblog.remove_server(str(guild.id))
 
 
 bot.run(TOKEN)
