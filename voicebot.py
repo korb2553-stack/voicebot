@@ -607,56 +607,124 @@ async def c_status(ctx, *, text: str):
 
 
 
-@bot.hybrid_command(name="ย้าย", description="ย้ายทุกคนจากห้องต้นทางไปห้องปลายทาง เช่น !ย้าย 123 to 456")
-@is_staff()
-@commands.guild_only()
-async def move_all(ctx, from_id: str, _to: str = None, to_id: str = None):
-    # รองรับทั้ง  !ย้าย <from> to <to>  และ  !ย้าย <from> <to>
-    if to_id is None:
-        if _to and _to.isdigit():
-            to_id = _to
-        else:
-            return await ctx.send("รูปแบบคำสั่ง: `!ย้าย <ไอดีห้องต้นทาง> to <ไอดีห้องปลายทาง>`")
-    if not from_id.isdigit() or not to_id.isdigit():
-        return await ctx.send("ไอดีห้องต้องเป็นตัวเลขเท่านั้น")
-    src = ctx.guild.get_channel(int(from_id))
-    dst = ctx.guild.get_channel(int(to_id))
-    if src is None:
-        return await ctx.send(f"ไม่พบห้องต้นทาง `{from_id}`")
-    if dst is None:
-        return await ctx.send(f"ไม่พบห้องปลายทาง `{to_id}`")
-    if not isinstance(src, discord.VoiceChannel) or not isinstance(dst, discord.VoiceChannel):
-        return await ctx.send("ต้องเป็นห้องเสียงเท่านั้น")
-    if ctx.interaction:
-        await ctx.defer()
-    t0 = time.perf_counter()
+
+
+# ----- Recall: เมนูเลือกห้อง (slash) / ไอดีตรง (prefix) -----
+async def _do_move(guild, src, dst, ctx_or_interaction):
+    """ย้ายทุกคนจาก src → dst แล้ว return embed รายงาน"""
+    import time as _time
+    t0 = _time.perf_counter()
     ok, protected = [], []
     for m in list(src.members):
         if m.bot:
             continue
         (protected if has_protected(m) else ok).append(m)
     results = await asyncio.gather(*[m.move_to(dst) for m in ok], return_exceptions=True)
-    moved = [m for m, r in zip(ok, results) if not isinstance(r, Exception)]
-    failed = [m for m, r in zip(ok, results) if isinstance(r, Exception)]
-    secs = time.perf_counter() - t0
+    moved  = [m for m, r in zip(ok, results) if not isinstance(r, Exception)]
+    failed = [m for m, r in zip(ok, results) if     isinstance(r, Exception)]
+    secs = _time.perf_counter() - t0
     moved_lines = "\n".join(f"• {m.mention} | **{m.display_name}** | {m.id}" for m in moved)
-    prot_lines = "\n".join(f"• {m.display_name}" for m in protected)
-    desc_parts = [
+    prot_lines  = "\n".join(f"• {m.display_name}" for m in protected)
+    parts = [
         f"📢 ห้องต้นทาง\n{src.mention}  ( {src.id} )",
         f"📥 ห้องปลายทาง\n{dst.mention}  ( {dst.id} )",
-        f"✅ **ย้ายสำเร็จ ({len(moved)} คน)**\n{moved_lines}" if moved else "✅ ไม่มีคนให้ย้าย",
+        (f"✅ **ย้ายสำเร็จ ({len(moved)} คน)**\n{moved_lines}" if moved else "✅ ไม่มีคนให้ย้าย"),
     ]
     if protected:
-        desc_parts.append(f"🛡️ **ข้าม (มี role) ({len(protected)} คน)**\n{prot_lines}")
+        parts.append(f"🛡️ **ข้าม (มี role) ({len(protected)} คน)**\n{prot_lines}")
     if failed:
-        desc_parts.append(f"❌ **ไม่สำเร็จ ({len(failed)} คน)**")
+        parts.append(f"❌ **ไม่สำเร็จ ({len(failed)} คน)**")
     embed = discord.Embed(
         title="📣 รายงาน Recall",
-        description="\n\n".join(desc_parts)[:4000],
+        description="\n\n".join(parts)[:4000],
         color=discord.Color.yellow(),
     )
     embed.set_footer(text=f"⚡ เวลาที่ใช้: {secs:.2f} วินาที")
+    return embed
+
+
+class MoveView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.src_id: int = 0
+        self.dst_id: int = 0
+
+        src_sel = discord.ui.ChannelSelect(
+            placeholder="📢 เลือกห้องต้นทาง",
+            channel_types=[discord.ChannelType.voice],
+            row=0,
+        )
+        dst_sel = discord.ui.ChannelSelect(
+            placeholder="📥 เลือกห้องปลายทาง",
+            channel_types=[discord.ChannelType.voice],
+            row=1,
+        )
+
+        async def pick_src(i: discord.Interaction):
+            self.src_id = src_sel.values[0].id
+            await i.response.defer()
+
+        async def pick_dst(i: discord.Interaction):
+            self.dst_id = dst_sel.values[0].id
+            await i.response.defer()
+
+        src_sel.callback = pick_src
+        dst_sel.callback = pick_dst
+        self.add_item(src_sel)
+        self.add_item(dst_sel)
+
+    @discord.ui.button(label="✅ ยืนยันย้าย", style=discord.ButtonStyle.success, row=2)
+    async def confirm(self, i: discord.Interaction, b: discord.ui.Button):
+        if not self.src_id or not self.dst_id:
+            return await i.response.send_message("เลือกห้องทั้งสองก่อน", ephemeral=True)
+        src = i.guild.get_channel(self.src_id)
+        dst = i.guild.get_channel(self.dst_id)
+        if src is None or dst is None:
+            return await i.response.send_message("ไม่พบห้องที่เลือก", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        embed = await _do_move(i.guild, src, dst, i)
+        # ปิด picker ให้คนใช้เห็นว่าสำเร็จ
+        await i.edit_original_response(content="✅ ดำเนินการแล้ว", view=None)
+        # ส่งรายงานให้ทุกคนเห็น
+        await i.channel.send(embed=embed)
+        self.stop()
+
+    @discord.ui.button(label="❌ ยกเลิก", style=discord.ButtonStyle.secondary, row=2)
+    async def cancel(self, i: discord.Interaction, b: discord.ui.Button):
+        await i.response.edit_message(content="ยกเลิกแล้ว", view=None)
+        self.stop()
+
+
+@bot.command(name="ย้าย")
+@is_staff()
+@commands.guild_only()
+async def move_prefix(ctx, from_id: str, _to: str = None, to_id: str = None):
+    """!ย้าย <ไอดีต้นทาง> to <ไอดีปลายทาง>"""
+    if to_id is None:
+        to_id = _to if (_to and _to.isdigit()) else None
+    if not (from_id and to_id and from_id.isdigit() and to_id.isdigit()):
+        return await ctx.send("รูปแบบ: `!ย้าย <ไอดีห้องต้นทาง> to <ไอดีห้องปลายทาง>`")
+    src = ctx.guild.get_channel(int(from_id))
+    dst = ctx.guild.get_channel(int(to_id))
+    if src is None: return await ctx.send(f"ไม่พบห้องต้นทาง `{from_id}`")
+    if dst is None: return await ctx.send(f"ไม่พบห้องปลายทาง `{to_id}`")
+    if not isinstance(src, discord.VoiceChannel) or not isinstance(dst, discord.VoiceChannel):
+        return await ctx.send("ต้องเป็นห้องเสียงเท่านั้น")
+    embed = await _do_move(ctx.guild, src, dst, ctx)
     await ctx.send(embed=embed)
+
+
+@bot.tree.command(name="ย้าย", description="ย้ายทุกคนจากห้องเสียงต้นทางไปปลายทาง (เฉพาะทีมงาน)")
+@commands.guild_only()
+async def move_slash(i: discord.Interaction):
+    if not (i.user.guild_permissions.administrator or
+            any(r.id in store.config["staff_roles"] for r in i.user.roles)):
+        return await i.response.send_message("คุณไม่มีสิทธิ์ใช้คำสั่งนี้", ephemeral=True)
+    await i.response.send_message(
+        "เลือกห้องต้นทางและปลายทาง แล้วกดยืนยัน",
+        view=MoveView(),
+        ephemeral=True,
+    )
 
 
 
