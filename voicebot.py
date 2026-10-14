@@ -504,13 +504,14 @@ async def create_room(member):
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.application_command:
         ch_name = getattr(interaction.channel, "name", "DM") if interaction.channel else "DM"
-        cmd_name = interaction.data.get("name","?")
+        cmd_name = interaction.data.get("name", "?")
         weblog.log_store.add("cmd",
             user_name=interaction.user.display_name,
             user_id=str(interaction.user.id),
             channel=ch_name,
             channel_id=str(interaction.channel_id or ""),
             desc=f"/{cmd_name}")
+    await bot.process_application_commands(interaction)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -569,8 +570,11 @@ async def on_ready():
                 pass
     store.save()
     await bot.change_presence(activity=discord.Streaming(name=STREAM_TEXT, url=STREAM_URL))
+    for g in bot.guilds:
+        icon_url = str(g.icon.url) if g.icon else None
+        weblog.set_server_info(g.name, icon_url)
+        break  # ใช้เซิร์ฟเวอร์แรก
     print(f"พร้อมใช้งาน: {bot.user}")
-    bot.tree.interaction_check = None
 
 
 # ----- คำสั่งข้อความ (prefix) -----
@@ -857,22 +861,6 @@ async def log_cmd(ctx):
         channel=ch_name, channel_id=str(ctx.channel.id),
         desc=f"!{ctx.command.qualified_name}")
 
-
-@bot.tree.error
-async def on_app_error(i: discord.Interaction, err):
-    pass  # suppress unhandled slash errors from logging noise
-
-
-async def _log_slash(i: discord.Interaction, cmd):
-    if i.user.bot:
-        return
-    ch_name = getattr(i.channel, "name", "DM")
-    weblog.log_store.add("cmd",
-        user_name=i.user.display_name, user_id=str(i.user.id),
-        channel=ch_name, channel_id=str(i.channel_id or ""),
-        desc=f"/{cmd.name}")
-
-bot.tree.on_error = on_app_error
 
 
 
