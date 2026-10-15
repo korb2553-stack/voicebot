@@ -376,7 +376,7 @@ loadServers(); setInterval(load,5000);
 </body></html>"""
 
 
-async def _idx(r): return web.Response(text=_HTML, content_type="text/html")
+async def _idx(r): return web.Response(text=_HTML, content_type="text/html", headers={"Access-Control-Allow-Origin":"*"})
 
 async def _img_serve(r):
     fname = r.match_info.get("fname","")
@@ -384,15 +384,15 @@ async def _img_serve(r):
     p = _IMG_DIR / fname
     if not p.exists(): return web.Response(status=404)
     ct = {"png":"image/png","gif":"image/gif","webp":"image/webp"}.get(fname.rsplit(".",1)[-1],"image/jpeg")
-    return web.Response(body=p.read_bytes(), content_type=ct)
-async def _srvs(r): return web.json_response(_servers)
+    return web.Response(body=p.read_bytes(), content_type=ct, headers={"Access-Control-Allow-Origin":"*"})
+async def _srvs(r): return web.json_response(_servers, headers={"Access-Control-Allow-Origin":"*"})
 async def _logs(r):
     gid   = r.query.get("guild","")
     cat   = r.query.get("cat","all")
     q     = r.query.get("q","")
     limit = min(int(r.query.get("limit","300")),500)
     if not gid and _servers: gid=_servers[0]["id"]
-    return web.json_response(log_store.query(gid,cat,limit,q))
+    return web.json_response(log_store.query(gid,cat,limit,q), headers={"Access-Control-Allow-Origin":"*"})
 
 async def start(port: int = None):
     port = port or int(os.getenv("SERVER_PORT","8080"))
