@@ -204,6 +204,11 @@ main{padding:10px 16px;max-width:980px;margin:0 auto;display:flex;flex-direction
 .mtag{display:inline-flex;align-items:center;gap:4px;background:#21262d;border:1px solid var(--border);border-radius:6px;padding:2px 7px;font-size:11px;color:#a0a8b8}
 /* count */
 .cnt{font-size:11px;color:var(--muted);white-space:nowrap;padding-top:2px}
+.who-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}
+.who-actor,.who-target{display:flex;align-items:center;gap:4px;background:#ffffff08;border:1px solid var(--border);border-radius:6px;padding:2px 8px 2px 4px}
+.who-label{font-size:9px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;margin-right:2px}
+.who-name{font-size:12px;font-weight:600;color:var(--text)}
+.who-target .who-label{color:#f97316aa}
 .empty{text-align:center;color:var(--muted);padding:60px;font-size:14px}
 @media(max-width:600px){.entry{grid-template-columns:60px auto 1fr}.cnt{display:none}.search-wrap input{width:130px}.search-wrap input:focus{width:150px}}
 </style></head>
@@ -286,10 +291,34 @@ function renderEntry(e){
   const ch=e.channel?`<span class="ch">🔊 ${esc(e.channel)}</span>`:'';
   const chMove=e.src_channel?`<span class="ch">📢 ${esc(e.src_channel)}</span><span class="arrow">→</span><span class="ch">📥 ${esc(e.dst_channel)}</span>`:'';
   const cnt=e.member_count!=null?e.member_count+' คน':e.count!=null?e.count+' คน':'';
+  // แสดงชื่อคนทำ (actor) และคนโดน (target) แยกชัดเจน
+  const aName=e.actor_name||e.staff_name||'';
+  const aAv=e.actor_avatar||e.staff_avatar||'';
+  const tName=e.target_name||'';
+  const tAv=e.target_avatar||'';
+  let whoRow='';
+  if(aName){
+    whoRow+=`<div class="who-actor">${av(aAv,aName,22)}<span class="who-label">ผู้ทำ</span><span class="who-name">${esc(aName)}</span></div>`;
+  }
+  if(tName && tName!==aName){
+    whoRow+=`<div class="who-target">${av(tAv,tName,22)}<span class="who-label">เป้าหมาย</span><span class="who-name">${esc(tName)}</span></div>`;
+  }
+  if(!aName){
+    const uName=e.user_name||'';
+    const uAv=e.user_avatar||'';
+    if(uName) whoRow+=`<div class="who-actor">${av(uAv,uName,22)}<span class="who-name">${esc(uName)}</span></div>`;
+  }
   return `<div class="entry" style="--clr:${e.color}">
     <div><div class="ts-t">${tt}</div><div class="ts-d">${dd}</div></div>
-    <div><span class="badge" style="color:${e.color};border-color:${e.color}33;background:${e.color}15">${e.icon} ${e.label}</span></div>
-    <div><div class="top-row">${actorTarget(e)}${ch}${chMove}</div>${e.desc?`<div class="desc">${esc(e.desc)}</div>`:''}${extra}${mems}</div>
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <span class="badge" style="color:${e.color};border-color:${e.color}33;background:${e.color}15">${e.icon} ${e.label}</span>
+      ${whoRow?`<div class="who-row">${whoRow}</div>`:''}
+    </div>
+    <div>
+      <div class="top-row">${ch}${chMove}</div>
+      ${e.desc?`<div class="desc">${esc(e.desc)}</div>`:''}
+      ${extra}${mems}
+    </div>
     <div class="cnt">${cnt}</div></div>`;
 }
 
